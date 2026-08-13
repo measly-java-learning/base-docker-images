@@ -1,0 +1,179 @@
+name: Build multi-arch image
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Image name under the owner namespace, e.g. engine-build
+        required: true
+        type: string
+      dockerfile:
+        description: Path to the Dockerfile, relative to the repository root
+        required: true
+        type: string
+      platforms:
+        description: JSON array of {platform, arch, runner} objects
+        required: false
+        type: string
+        default: >-
+          [
+            {"platform":"linux/amd64","arch":"amd64","runner":"ubuntu-latest"},
+            {"platform":"linux/arm64","arch":"arm64","runner":"ubuntu-24.04-arm"}
+          ]
+      push:
+        description: Push and merge. False for pull requests, which build only.
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      image:
+        description: Fully qualified image name. Empty when push is false.
+        value: ${{ jobs.merge.outputs.image }}
+      digest:
+        description: Digest of the published manifest list. Empty when push is false.
+        value: ${{ jobs.merge.outputs.digest }}
+
+jobs:
+  build:
+    runs-on: ${{ matrix.combo.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        combo: ${{ fromJSON(inputs.platforms) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: ${{ inputs.push }}
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # Duplicated verbatim in the merge job on purpose. Matrix job outputs are
+      # last-writer-wins across legs, so recomputing is clearer than plumbing an
+      # output through a fan-in.
+      - name: Compute image name and tag
+        id: vars
+        env:
+          OWNER: ${{ github.repository_owner }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          set -euo pipefail
+          echo "image=ghcr.io/${OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract OCI labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.vars.outputs.image }}
+
+      # provenance/sbom are disabled here so each arch tag stays a plain manifest.
+      # Buildx would otherwise wrap it in a small index, and attestation belongs on
+      # the final manifest list, once, in the merge job.
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.combo.platform }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.sha_tag }}-${{ matrix.combo.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+
+  merge:
+    if: ${{ inputs.push }}
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      digest: ${{ steps.index.outputs.digest }}
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Compute image name and tag
+        id: vars
+        env:
+          OWNER: ${{ github.repository_owner }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          set -euo pipefail
+          echo "image=ghcr.io/${OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Create manifest list
+        id: index
+        env:
+          IMAGE: ${{ steps.vars.outputs.image }}
+          SHA_TAG: ${{ steps.vars.outputs.sha_tag }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          mapfile -t srcs < <(jq -r --arg i "$IMAGE" --arg t "$SHA_TAG" \
+                                '.[] | "\($i):\($t)-\(.arch)"' <<< "$PLATFORMS")
+          tags=(-t "$IMAGE:$SHA_TAG")
+          # Must be a full `if`. Under `set -e`, `[ ... ] && tags+=(...)` aborts the
+          # step whenever the test is false, i.e. on every dispatch from a branch.
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            tags+=(-t "$IMAGE:main")
+          fi
+          docker buildx imagetools create "${tags[@]}" "${srcs[@]}"
+          digest=$(docker buildx imagetools inspect \
+                     --format '{{json .Manifest.Digest}}' "$IMAGE:$SHA_TAG" | tr -d '"')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the index resolves every requested platform
+        env:
+          IMAGE: ${{ steps.vars.outputs.image }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          got=$(docker buildx imagetools inspect --raw "$IMAGE@$DIGEST" \
+                | jq -r '[.manifests[]
+                          | select(.platform.os != "unknown")
+                          | "\(.platform.os)/\(.platform.architecture)"]
+                         | sort | join(",")')
+          want=$(jq -r '[.[].platform] | sort | join(",")' <<< "$PLATFORMS")
+          echo "index advertises: $got"
+          echo "expected:         $want"
+          if [ "$got" != "$want" ]; then
+            echo "manifest list does not match the requested platforms" >&2
+            exit 1
+          fi
+
+      - name: Write the pin to the job summary
+        env:
+          IMAGE: ${{ steps.vars.outputs.image }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Four-space indent renders as a code block. Deliberately avoids fenced
+          # blocks so this script contains no backticks of its own.
+          {
+            echo "### Published"
+            echo
+            echo "    ${IMAGE}@${DIGEST}"
+            echo
+            echo "Pin consumers to the digest above. Tags are not a supported interface."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ steps.vars.outputs.image }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: false
