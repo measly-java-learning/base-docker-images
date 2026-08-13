@@ -1,0 +1,37 @@
+name: Publish Engine Images
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - dockerfiles/**
+      - .dockerignore
+      - .github/workflows/publish-engine-images.yml
+      - .github/workflows/build-multi-arch-image.yml
+  pull_request:
+    paths:
+      - dockerfiles/**
+      - .dockerignore
+      - .github/workflows/publish-engine-images.yml
+      - .github/workflows/build-multi-arch-image.yml
+
+# Cancel superseded PR runs, but never cancel on main: two runs racing to
+# `imagetools create -t ...:main` could otherwise land in either order.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  engine-build:
+    uses: ./.github/workflows/build-multi-arch-image.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    with:
+      image-name: engine-build
+      dockerfile: dockerfiles/engine-build.Dockerfile
+      push: ${{ github.event_name != 'pull_request' }}
