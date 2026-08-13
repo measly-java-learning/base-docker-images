@@ -438,20 +438,24 @@ accepted re-pin. The D6 tripwire was verified against the same base: `rpm -q --q
 '%{VERSION}-%{RELEASE}' gcc-toolset-14-gcc` returns `14.2.1-11.el8_10`, matching
 `MEASLY_DJL_TOOLSET_NEVRA` exactly.
 
-**Attestation mechanics are unconfirmed** (D7): whether GHCR exposes OCI referrer manifests as
-untagged package versions, and the exact working form of `gh attestation verify` against a GHCR
-image with `push-to-registry: false`. Both are to be established during implementation. Neither
-blocks publishing; attestation is additive.
+**Attestation mechanics are confirmed** (D7): on first publish (2026-08-13), with
+`push-to-registry: false`, `gh attestation verify oci://ghcr.io/measly-java-learning/
+engine-build@sha256:725884538caa4f7f8444847e34b3928bb90089da95d5b77ce560aa2e624f905b
+--owner measly-java-learning` exited 0 (the command's success is silent; the exit code is the
+verdict). The attestation is discoverable from GitHub's attestation store without any registry
+referrer, and GHCR's package listing shows 0 untagged versions — the D4 retention hazard does
+not materialise, so `push-to-registry` stays `false`.
 
-**GHCR package visibility is a manual bootstrap.** A package created by a workflow defaults to
-private, and the cross-org consumer `corey-cole/djl-executorch-engine` requires anonymous pull.
-The flip to public is a one-time action in package settings after the first publish, recorded in
-the README. Whether it is genuinely one-time or re-asserted per publish is confirmed by
-verification step 3.
+**GHCR package visibility is a confirmed one-time bootstrap.** The package was created private
+by the first workflow publish, flipped to public once in package settings (2026-08-13), and
+held: the package page shows Public, and `docker pull` of the index digest from a
+logged-out shell (`docker logout ghcr.io` first) succeeded anonymously. The flip did not need
+re-applying on this first publish; it is recorded in the README as a one-time bootstrap step.
 
-**Action major versions are stale in the current tree** — `login-action@v2`, `metadata-action@v5`,
-`build-push-action@v5` against v4, v6, and v7 upstream. The rewrite adopts current majors
-directly rather than leaving them for Dependabot.
+**Action major versions are current** — the rewrite adopted `checkout@v7`,
+`login-action@v4`, `metadata-action@v6`, `build-push-action@v7`, `setup-buildx-action@v3`, and
+`attest-build-provenance@v3` directly (resolving the stale `v2`/`v5`/`v5` tree), and the first
+publish run executed them successfully. Dependabot covers `github-actions` for future bumps.
 
 ## Related
 
