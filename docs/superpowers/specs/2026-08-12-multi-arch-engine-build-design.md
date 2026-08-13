@@ -421,9 +421,15 @@ repository root.
 carries only current builds. When `gcc-toolset-14` gets its next upstream release,
 `14.2.1-11.el8_10` disappears and the image stops building on unchanged source and an unchanged
 base — the PR #27 incident arriving through the RPM repository instead of the base tag. This is
-pre-existing and not introduced here. It has not been checked whether that NEVRA is still
-installable today; the first CI build will answer it. Mitigation when it bites is a vault or
-archive repository, or an accepted re-pin.
+pre-existing and not introduced here.
+
+Checked 2026-08-12 against the pinned base: all three NEVRAs still resolve from AppStream
+(`gcc-toolset-14-libasan-devel-14.2.1-11.el8_10`,
+`gcc-toolset-14-libubsan-devel-14.2.1-11.el8_10`, `systemtap-sdt-devel-4.9-3.el8`), so the risk
+is latent rather than active. Mitigation when it bites is a vault or archive repository, or an
+accepted re-pin. The D6 tripwire was verified against the same base: `rpm -q --qf
+'%{VERSION}-%{RELEASE}' gcc-toolset-14-gcc` returns `14.2.1-11.el8_10`, matching
+`MEASLY_DJL_TOOLSET_NEVRA` exactly.
 
 **Attestation mechanics are unconfirmed** (D7): whether GHCR exposes OCI referrer manifests as
 untagged package versions, and the exact working form of `gh attestation verify` against a GHCR
