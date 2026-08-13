@@ -75,6 +75,13 @@ misbuild unless a contributor hand-copies three arguments out of a workflow file
 explicitly values the local-DX property that a contributor's first run costs nothing; a
 zero-argument `docker build .` that works on either an x86 or ARM laptop is that property.
 
+One caveat on that claim: it holds **on BuildKit**. `TARGETARCH` is a BuildKit-provided build
+arg, so on a machine where `docker build` falls back to the deprecated legacy builder — Docker
+installed without the buildx plugin, as on `radxa-dragon-q6a.local` — the variable is empty and
+the build fails on the `case`'s catch-all arm. That is the guard behaving correctly, but the
+message names the symptom rather than the cause. Contributors on such a machine should build
+through a buildx node rather than the local daemon.
+
 Also rejected: two Dockerfiles over a shared base image. Adds a publish stage and a second
 digest to track, and relocates the drift risk rather than removing it.
 
