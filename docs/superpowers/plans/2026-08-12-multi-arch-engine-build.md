@@ -44,9 +44,17 @@ retyped from memory.
   `sha-<short7>-<arch>`. Supported consumption interface is the index digest only.
 - **Dependabot (D6):** `github-actions` ecosystem only. Do **not** add a `docker` ecosystem entry.
 - **Local tooling available:** `docker` 29.7.2, `buildx` v0.36.1, `actionlint` 1.7.12 (runs
-  shellcheck over `run:` blocks), `shellcheck`, `jq` 1.7, `gh` 2.97.0. `hadolint` is **not**
-  installed — do not add steps that require it. `qemu-aarch64` **is** registered, so
-  `--platform linux/arm64` builds work locally.
+  shellcheck over `run:` blocks), `shellcheck`, `jq` 1.7, `gh` 2.97.0, PyYAML 6.0.1.
+- **hadolint runs as a container**, not a local install, pinned like everything else here:
+  `hadolint/hadolint@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d`
+  (v2.15.1).
+- **arm64 builds are native, not emulated.** `radxa-dragon-q6a.local` (aarch64, Docker 29.1.3,
+  89 GB free, ssh key auth confirmed) is driven as a remote buildx node; Task 1 sets this up.
+  `qemu-aarch64` is also registered locally as a fallback, but emulating this image's `dnf` and
+  `pip` layers takes roughly thirty minutes against a few minutes native, so prefer the node.
+  That host has **no buildx plugin** — running `docker build` on it directly falls back to the
+  legacy builder, which does not populate `TARGETARCH`, so the `case` receives an empty string
+  and fails on the `*)` guard. Always build through the remote node from this machine.
 
 ---
 
@@ -99,6 +107,11 @@ deliberately — they record *why* each pin exists and are the most valuable par
 # the real pin: a floating base tag rebuilding underneath a green tree is the incident that
 # motivated pinning in the first place.
 FROM quay.io/pypa/manylinux_2_28:2026.06.04-1@sha256:102e1adde208e2d9550cc94aaf70c66f09e0f80979e95e7f626ca82781d37379
+
+# Every RUN below uses `set -eu`; pipefail completes that, so a failure on the left of a pipe
+# cannot be masked by a successful right-hand side. bash is present in the base image. Without
+# this, hadolint DL4006 fires on the two RUNs containing pipes.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # gcc-toolset-14-libasan-devel  the ASan runtime for native/build_qa.sh. Held to 14.2.1-11.el8_10
 #                      to match the base image's own compiler exactly (gcc 14.2.1-11); a libasan
@@ -228,16 +241,57 @@ RUN set -eu; \
 The `base_gcc` check is the D6 tripwire. It has been verified against the pinned base: `rpm -q
 --qf '%{VERSION}-%{RELEASE}' gcc-toolset-14-gcc` returns `14.2.1-11.el8_10`.
 
-- [ ] **Step 3: Build natively for amd64 and confirm the assertions pass**
+- [ ] **Step 3: Lint the Dockerfile**
+
+hadolint runs as a pinned container, so nothing needs installing:
 
 ```bash
-docker buildx build --platform linux/amd64 -f dockerfiles/engine-build.Dockerfile -t engine-build:test-amd64 --load .
+docker run --rm -i \
+  hadolint/hadolint@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d \
+  hadolint - < dockerfiles/engine-build.Dockerfile
 ```
 
-Expected: build succeeds, and the final layer prints
-`image assertions passed for TARGETARCH=amd64`.
+Expected: no output, exit 0. If DL4006 fires, the `SHELL ["/bin/bash", "-o", "pipefail", "-c"]`
+line is missing or was placed after the first `RUN` that contains a pipe.
 
-- [ ] **Step 4: Red-test the tripwire**
+- [ ] **Step 4: Set up the two-node native builder**
+
+Both architectures are built natively: amd64 on this machine, arm64 on the aarch64 host
+`radxa-dragon-q6a.local` driven as a remote buildx node. This is one-time setup; skip if
+`docker buildx ls` already shows a `multiarch` builder with both nodes running.
+
+```bash
+docker buildx create --name multiarch --driver docker-container --platform linux/amd64 default
+docker buildx create --name multiarch --append --driver docker-container --platform linux/arm64 \
+  ssh://radxa@radxa-dragon-q6a.local
+docker buildx inspect --bootstrap multiarch
+docker buildx ls
+```
+
+Expected: `multiarch0` on `unix:///var/run/docker.sock` advertising `linux/amd64*`, and
+`multiarch1` on `ssh://radxa@radxa-dragon-q6a.local` advertising `linux/arm64*`, both `running`.
+
+**Do not SSH into the Radxa and run `docker build` there.** That host has no buildx plugin, so
+`docker build` falls back to the legacy builder, which does not populate `TARGETARCH` — the
+`case` would receive an empty string and fail on the `*)` guard. Driving it as a remote node
+keeps buildx local and uses only the remote daemon. Tear down with `docker buildx rm multiarch`
+when finished; that also stops the `buildkitd` container on the remote.
+
+- [ ] **Step 5: Build both architectures natively and confirm the assertions pass**
+
+```bash
+docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
+  -f dockerfiles/engine-build.Dockerfile .
+```
+
+Expected: both legs succeed, printing `image assertions passed for TARGETARCH=amd64` and
+`image assertions passed for TARGETARCH=arm64`. No output flag is needed — the assertions run
+during the build, and `--load` cannot accept a multi-platform result anyway.
+
+The arm64 leg is the only local check that the arm64 Corretto SHA256 is correct; CI would
+otherwise be the first place that pin is exercised.
+
+- [ ] **Step 6: Red-test the tripwire**
 
 Prove the new assertion actually fires rather than being decorative. Temporarily edit only the
 `ENV MEASLY_DJL_TOOLSET_NEVRA` line to a value the base cannot match:
@@ -245,40 +299,33 @@ Prove the new assertion actually fires rather than being decorative. Temporarily
 ```bash
 sed -i 's/^ENV MEASLY_DJL_TOOLSET_NEVRA=.*/ENV MEASLY_DJL_TOOLSET_NEVRA=14.2.1-99.el8_10/' \
   dockerfiles/engine-build.Dockerfile
-docker buildx build --platform linux/amd64 -f dockerfiles/engine-build.Dockerfile -t engine-build:redtest .
+docker buildx build --builder multiarch --platform linux/amd64 \
+  -f dockerfiles/engine-build.Dockerfile .
 ```
+
+Only amd64 here — this exercises the assertion logic, which is architecture-independent, so
+paying for the arm64 leg twice buys nothing.
 
 Expected: FAIL. Because the dnf line still uses the literal pin, the `rpm -q` libasan check
 fires first with `libasan NEVRA not installed as pinned`. That is correct behaviour and proves
 the assertion chain aborts at the first failure with its own message rather than a later one.
 
-- [ ] **Step 5: Revert the tripwire edit and confirm green again**
+- [ ] **Step 7: Revert the tripwire edit, and load the amd64 image for inspection**
 
 ```bash
 sed -i 's/^ENV MEASLY_DJL_TOOLSET_NEVRA=.*/ENV MEASLY_DJL_TOOLSET_NEVRA=14.2.1-11.el8_10/' \
   dockerfiles/engine-build.Dockerfile
-git diff --exit-code dockerfiles/engine-build.Dockerfile 2>/dev/null || true
-docker buildx build --platform linux/amd64 -f dockerfiles/engine-build.Dockerfile -t engine-build:test-amd64 --load .
+grep -n '^ENV MEASLY_DJL_TOOLSET_NEVRA=' dockerfiles/engine-build.Dockerfile
+docker buildx build --builder multiarch --platform linux/amd64 \
+  -f dockerfiles/engine-build.Dockerfile -t engine-build:test-amd64 --load .
 ```
 
-Expected: PASS, printing `image assertions passed for TARGETARCH=amd64`. Confirm by eye that
-the `ENV MEASLY_DJL_TOOLSET_NEVRA` line reads `14.2.1-11.el8_10` before continuing.
+Expected: the `grep` prints `ENV MEASLY_DJL_TOOLSET_NEVRA=14.2.1-11.el8_10` — confirm this
+before continuing — and the build passes, printing
+`image assertions passed for TARGETARCH=amd64`. `--load` is valid here because this is a
+single-platform build; it puts the image in the local daemon for the next step.
 
-- [ ] **Step 6: Build for arm64 under emulation**
-
-`qemu-aarch64` is registered on this machine, so this is a real cross-arch build. It is
-substantially slower than the native build — the `dnf` and `pip` layers run emulated. Allow up
-to ~30 minutes.
-
-```bash
-docker buildx build --platform linux/arm64 -f dockerfiles/engine-build.Dockerfile -t engine-build:test-arm64 .
-```
-
-Expected: build succeeds, printing `image assertions passed for TARGETARCH=arm64`. This is the
-one local check that the arm64 Corretto SHA256 is correct — CI would otherwise be the first
-place that pin is exercised.
-
-- [ ] **Step 7: Spot-check the built image matches the consumer contract**
+- [ ] **Step 8: Spot-check the built image matches the consumer contract**
 
 ```bash
 docker run --rm engine-build:test-amd64 bash -c '
@@ -295,7 +342,7 @@ docker run --rm engine-build:test-amd64 bash -c '
 Expected: prints `JAVA_HOME=/opt/corretto-jdk`, `1.13.0.git.kitware.jobserver-pipe-1`,
 `1 14 14.2.1-11.el8_10`, the libasan NEVRA, and `OK`.
 
-- [ ] **Step 8: Delete the superseded Dockerfiles**
+- [ ] **Step 9: Delete the superseded Dockerfiles**
 
 ```bash
 git rm dockerfiles/linux-x86_64.Dockerfile dockerfiles/linux-aarch64.Dockerfile
@@ -304,7 +351,7 @@ git rm dockerfiles/linux-x86_64.Dockerfile dockerfiles/linux-aarch64.Dockerfile
 Note: these files are currently untracked in git. If `git rm` reports `did not match any
 files`, remove them with plain `rm` instead.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add .dockerignore dockerfiles/
